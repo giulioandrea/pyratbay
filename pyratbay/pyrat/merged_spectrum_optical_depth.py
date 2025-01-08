@@ -351,7 +351,7 @@ class Spectrum():
 
 
 #
-#    M E T H O D S   (do GPU stuff here if desired)
+#    M E T H O D S   (do GPU stuff)
 #
 
 def spectrum(pyrat):
@@ -650,7 +650,7 @@ def optical_depth(pyrat):
         pass
 
     elif od.rt_path in pc.transmission_rt:
-        # We'll do a single CPU->GPU flatten pass for ec, intervals, etc.
+        # Single CPU->GPU flatten pass for ec, intervals, etc.
         # Then one kernel call, and one GPU->CPU pass for depth (if we want depth on CPU).
         # But we already have ec on GPU if GPU_AVAILABLE.
 
@@ -661,7 +661,7 @@ def optical_depth(pyrat):
         # shape must be (rbottom-rtop, something). We'll pad them if needed
         # for the kernel logic:
         if (rbottom - rtop) <= 0:
-            # no layers?
+            # no layers
             pass
         else:
             max_len = len(od.raypath[-1])  # last sub-array length
