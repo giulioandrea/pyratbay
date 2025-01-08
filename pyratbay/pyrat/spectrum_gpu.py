@@ -383,67 +383,75 @@ def spectrum(pyrat):
 
 def modulation(pyrat):
     """
-    Calculate transmission spectrum for transit geometry.
-    If desired, we can GPU-accelerate the integrand and trapz, etc.
-    below is an example of how to do partial GPU usage.
+    Example GPU usage in the exponent + multiplication steps,
+    then fallback to CPU trapz2D.
     """
-    # We can choose to do everything on CPU if we like:
-    rtop = pyrat.atm.rtop
-    radius = pyrat.atm.radius         # CPU array
-    depth  = pyrat.od.depth           # CPU array
+    import cupy as cp  # Or use the 'xp' approach from your code
+    GPU_AVAILABLE = True  # If you’ve already tested `cp` import, etc.
+
+    rtop    = pyrat.atm.rtop
+    radius  = pyrat.atm.radius    # CPU (NumPy array)
+    depth   = pyrat.od.depth      # CPU (NumPy array)
     nlayers = pyrat.od.ideep - rtop + 1
 
-    # Suppose we do exponent on GPU:
-    # 1) Convert arrays to GPU if available:
+    # 1) Transfer arrays to GPU:
     if GPU_AVAILABLE:
-        xp = cp
-        radius_gpu = xp.asarray(radius)
-        depth_gpu  = xp.asarray(depth)
-        h_gpu = xp.ediff1d(radius_gpu[rtop:])
-        integ_gpu = xp.exp(-depth_gpu[rtop:,:]) * xp.expand_dims(radius_gpu[rtop:], 1)
-        # Move back to CPU for trapz2D:
-        h_cpu    = h_gpu.get()
-        integ_cpu= integ_gpu.get()
+        radius_gpu = cp.asarray(radius)             # shape [nlayers_total]
+        depth_gpu  = cp.asarray(depth)              # shape [nlayers_total, nwave]
+        # We only care about rtop: for the partial slices:
+        h_gpu = cp.ediff1d(radius_gpu[rtop:])
+        integ_gpu = cp.exp(-depth_gpu[rtop:,:]) * cp.expand_dims(radius_gpu[rtop:], 1)
     else:
         # fallback CPU
-        radius_np = radius
-        depth_np  = depth
-        h_cpu = np.ediff1d(radius_np[rtop:])
-        integ_cpu = np.exp(-depth_np[rtop:,:])*np.expand_dims(radius_np[rtop:],1)
+        import numpy as np
+        h_cpu = np.ediff1d(radius[rtop:])
+        integ_cpu = np.exp(-depth[rtop:,:]) * np.expand_dims(radius[rtop:],1)
 
-    # Possibly handle deck model on CPU:
+    # 2) Deck model fix on CPU:
+    #    We must do interpolation with CPU-based interp1d => need data on CPU:
+    if GPU_AVAILABLE:
+        h_cpu = h_gpu.get()          # copy to CPU
+        integ_cpu = integ_gpu.get()  # copy to CPU
+    else:
+        # already on CPU
+        pass
+
     for model in pyrat.opacity.models:
         if model.name == 'deck' and model.itop > rtop:
-            # Adjust h:
-            h_cpu[model.itop-rtop-1] = model.rsurf - radius[model.itop-1]
-            # Adjust integ by interpolation:
-            f = interp1d(radius[rtop:], integ_cpu, axis=0)
+            deck_index = model.itop - rtop - 1
+            h_cpu[deck_index] = model.rsurf - radius[model.itop-1]
+            f = interp1d(radius[rtop:], integ_cpu, axis=0)   # CPU SciPy
             new_val = f(model.rsurf)
-            integ_cpu[model.itop-rtop] = new_val
+            integ_cpu[model.itop - rtop] = new_val
             break
 
-    # 2) CPU-based 2D trapz:
-    spectrum_val = t.trapz2D(integ_cpu, h_cpu, nlayers-1)
+    # 3) CPU-based 2D trapz:
+    #    You could move to GPU-based trapz if you want, but let's say it’s CPU:
+    spectrum_val = t.trapz2D(integ_cpu, h_cpu, nlayers - 1)
 
-    # 3) Convert final to CPU-based result:
     rp = radius[rtop]
-    pyrat.spec.spectrum = (rp*rp + 2*spectrum_val)/(pyrat.phy.rstar**2)
+    pyrat.spec.spectrum = (rp*rp + 2.0*spectrum_val)/(pyrat.phy.rstar**2)
 
-    # Patchy case:
+    # 4) Patchy case:
     if pyrat.opacity.is_patchy:
+        # similarly handle depth_clear, etc.
         depth_clear = pyrat.od.depth_clear
         nlayers_clear = pyrat.od.ideep_clear - rtop + 1
         if GPU_AVAILABLE:
-            depth_clear_gpu = xp.asarray(depth_clear)
-            integ_clear_gpu = xp.exp(-depth_clear_gpu[rtop:,:]) * xp.expand_dims(radius_gpu[rtop:],1)
+            depth_clear_gpu = cp.asarray(depth_clear)
+            integ_clear_gpu = cp.exp(-depth_clear_gpu[rtop:,:]) \
+                              * cp.expand_dims(radius_gpu[rtop:],1)
             h_clear_gpu = h_gpu.copy()
-            # back to CPU
-            h_clear_cpu = h_clear_gpu.get()
-            integ_clear_cpu = integ_clear_gpu.get()
+            # Then copy back to CPU:
+            h_clear_cpu      = h_clear_gpu.get()
+            integ_clear_cpu  = integ_clear_gpu.get()
         else:
-            integ_clear_cpu = np.exp(-depth_clear[rtop:,:]) * \
-                              np.expand_dims(radius[rtop:],1)
+            # CPU fallback
             h_clear_cpu = h_cpu.copy()
+            integ_clear_cpu = (
+                np.exp(-depth_clear[rtop:,:])
+                * np.expand_dims(radius[rtop:], 1)
+            )
 
         clear_val = t.trapz2D(integ_clear_cpu, h_clear_cpu, nlayers_clear-1)
         clear_spectrum = (rp*rp + 2*clear_val)/(pyrat.phy.rstar**2)
@@ -451,8 +459,8 @@ def modulation(pyrat):
         pyrat.spec.clear  = clear_spectrum
         pyrat.spec.cloudy = pyrat.spec.spectrum
         fpatchy = pyrat.opacity.fpatchy
-        pyrat.spec.spectrum = (pyrat.spec.cloudy*fpatchy
-                               + pyrat.spec.clear*(1-fpatchy))
+        pyrat.spec.spectrum = (pyrat.spec.cloudy*fpatchy +
+                               pyrat.spec.clear*(1.0 - fpatchy))
 
 
 def intensity(pyrat):
@@ -485,80 +493,77 @@ def intensity(pyrat):
 
 
 def flux(pyrat):
-    """
-    Calculate the hemisphere-integrated flux spectrum (erg s-1 cm-2 cm)
-    for eclipse geometry.
-    """
     spec = pyrat.spec
-    # Weighted sum of intensities:
-    w = spec.quadrature_weights  # shape [nangles, 1]
-    # broadcast multiply [nangles, nwave] * [nangles,1], sum over nangles
-    spec.spectrum[:] = np.sum(spec.intensity * w, axis=0)
-
+    if GPU_AVAILABLE:
+        import cupy as cp
+        intensity_gpu = cp.asarray(spec.intensity)                # shape (nangles, nwave)
+        weights_gpu   = cp.asarray(spec.quadrature_weights)       # shape (nangles, 1)
+        flux_gpu = cp.sum(intensity_gpu * weights_gpu, axis=0)    # shape (nwave)
+        spec.spectrum = flux_gpu.get()                            # copy to CPU
+    else:
+        spec.spectrum[:] = np.sum(
+            spec.intensity * spec.quadrature_weights, axis=0
+        )
 
 def two_stream(pyrat):
-    """
-    Two-stream approximation.
-    For brevity, we do CPU-based logic here.
-    """
-    pyrat.log.msg('Compute two-stream flux spectrum (CPU).', indent=2)
+    pyrat.log.msg('Compute two-stream flux spectrum (GPU partial).', indent=2)
     spec = pyrat.spec
-    phy = pyrat.phy
+    phy  = pyrat.phy
     nlayers = pyrat.atm.nlayers
 
-    # Internal flux from interior temperature:
-    spec.f_int = ps.blackbody_wn(spec.wn, pyrat.atm.tint)
+    # Planck from interior T
+    spec.f_int = ps.blackbody_wn(spec.wn, pyrat.atm.tint)  # CPU
     total_f_int = np.trapz(spec.f_int, spec.wn)
     if total_f_int > 0:
-        scale = pc.sigma * (pyrat.atm.tint**4) / total_f_int
+        scale = pc.sigma*(pyrat.atm.tint**4)/total_f_int
         spec.f_int *= scale
 
-    # dtau0 = difference in depth:
-    dtau0 = np.diff(pyrat.od.depth, axis=0)
-    # trans = ...
-    # SciPy exp1 => CPU
-    trans = (1 - dtau0)*np.exp(-dtau0) + dtau0**2 * ss.exp1(dtau0)
+    dtau0_cpu = np.diff(pyrat.od.depth, axis=0)  # CPU
+    # We'll do trans partially on GPU:
+    if GPU_AVAILABLE:
+        import cupy as cp
+        dtau0_gpu = cp.asarray(dtau0_cpu)
+        # But we need exp1, which is CPU-based:
+        dtau0_cpu2 = dtau0_gpu.get()
+        trans_cpu = (1 - dtau0_cpu2)*np.exp(-dtau0_cpu2) + dtau0_cpu2**2 * ss.exp1(dtau0_cpu2)
+        trans_gpu = cp.asarray(trans_cpu)
+    else:
+        trans_cpu = (1 - dtau0_cpu)*np.exp(-dtau0_cpu) + dtau0_cpu**2*ss.exp1(dtau0_cpu)
+        trans_gpu = None  # Not used if no GPU
 
-    # Build blackbody B array, CPU:
-    B = ps.blackbody_wn_2D(spec.wn, pyrat.atm.temp)
-    # Bp
-    Bp = np.diff(B, axis=0)/dtau0
+    # Build blackbody B
+    B = ps.blackbody_wn_2D(spec.wn, pyrat.atm.temp)  # CPU
+    Bp_cpu = np.diff(B, axis=0)/dtau0_cpu           # CPU
 
-    # flux_down/up:
-    spec.flux_down = np.zeros((nlayers, spec.nwave), dtype=np.float64)
-    spec.flux_up   = np.zeros((nlayers, spec.nwave), dtype=np.float64)
+    # Possibly copy B, Bp to GPU if we want to do the up/down loops on GPU:
+    # For a small code snippet, we might keep them CPU:
+    flux_down = np.zeros((nlayers, spec.nwave), dtype=float)
+    flux_up   = np.zeros((nlayers, spec.nwave), dtype=float)
 
-    # Possibly starflux:
-    is_irradiation = (
-        spec.starflux is not None
-        and pyrat.atm.smaxis is not None
-        and phy.rstar is not None
-    )
-    if is_irradiation:
-        spec.flux_down[0] = (
-            pyrat.atm.beta_irr * (phy.rstar/pyrat.atm.smaxis)**2
-        ) * spec.starflux
+    # Possibly star flux
+    is_irr = (spec.starflux is not None and pyrat.atm.smaxis is not None and phy.rstar is not None)
+    if is_irr:
+        flux_down[0] = pyrat.atm.beta_irr * (phy.rstar/pyrat.atm.smaxis)**2 * spec.starflux
 
-    # Downward flux:
+    # CPU loops:
     for i in range(nlayers-1):
-        spec.flux_down[i+1] = (
-            trans[i]*spec.flux_down[i]
-            + np.pi*B[i]*(1-trans[i])
-            + np.pi*Bp[i]*(
-                -2/3*(1-np.exp(-dtau0[i])) + dtau0[i]*(1-trans[i]/3)
+        td = trans_cpu[i] if trans_gpu is not None else 1.0  # fallback
+        flux_down[i+1] = (
+            td*flux_down[i] + np.pi*B[i]*(1-td)
+            + np.pi*Bp_cpu[i]*(
+                -2/3*(1 - np.exp(-dtau0_cpu[i])) + dtau0_cpu[i]*(1 - td/3)
             )
         )
 
-    # Upward flux:
-    spec.flux_up[-1] = spec.flux_down[-1] + spec.f_int
+    flux_up[-1] = flux_down[-1] + spec.f_int
     for i in reversed(range(nlayers-1)):
-        spec.flux_up[i] = (
-            trans[i]*spec.flux_up[i+1]
-            + np.pi*B[i+1]*(1-trans[i])
-            + np.pi*Bp[i]*(
-                2/3*(1-np.exp(-dtau0[i])) - dtau0[i]*(1-trans[i]/3)
+        td = trans_cpu[i]
+        flux_up[i] = (
+            td*flux_up[i+1] + np.pi*B[i+1]*(1-td)
+            + np.pi*Bp_cpu[i]*(
+                2/3*(1 - np.exp(-dtau0_cpu[i])) - dtau0_cpu[i]*(1 - td/3)
             )
         )
 
-    spec.spectrum = spec.flux_up[0]
+    spec.spectrum = flux_up[0]
 
