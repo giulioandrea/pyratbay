@@ -1,0 +1,42 @@
+__global__ void parallelize_tau_gloria_for(
+    double *tau, 
+    int *ideep, 
+    double *intervals, 
+    double taumax, 
+    double *data, 
+    int nwave,
+    int nr,
+    int rtop
+){
+    int jx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (jx >= nwave) return;
+
+    // 1) Mark not found
+    ideep[jx] = -1;
+
+    // 2) Initialize tau[...] = 0.0 in one pass
+    //    (So we don't do it repeatedly inside the r-loop)
+    for (int r = 0; r < nr; r++) {
+        tau[jx + r*nwave] = 0.0;
+    }
+
+    // 3) Main loop
+    for (int r = 0; r < nr; r++) {
+        // Only compute if we haven't found index yet
+        if (ideep[jx] < 0) {
+            double Integral = 0.0;
+
+            // Possibly unroll if nr is small
+            for (int i = 0; i <= r; i++) {
+                Integral += intervals[i + r*(nr-1)]
+                         * (data[jx + (i + 1)*nwave] + data[jx + i*nwave]);
+            }
+            tau[jx + r*nwave] = Integral;
+
+            if (Integral > taumax) {
+                ideep[jx] = r;
+                break;  // Early exit
+            }
+        }
+    }
+}
