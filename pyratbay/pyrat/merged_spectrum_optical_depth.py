@@ -674,7 +674,7 @@ def optical_depth(pyrat):
 
         # If patchy:
         if f_patchy is not None:
-            # kept the GPU version of patchy calculations
+            # kept the CPU version of patchy calculations
             od.ideep_clear = np.full(nwave, -1, dtype=np.int32)
             for r in range(rtop, rbottom):
                 # standard CPU approach from trapz or partial approach
