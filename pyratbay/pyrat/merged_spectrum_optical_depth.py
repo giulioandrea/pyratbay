@@ -1,10 +1,5 @@
-# merged_spectrum_od_optimized.py
-# -------------------------------------------------------------------
-#  Single-file example demonstrating:
-#  - Spectrum class & methods (CPU-based constructor).
-#  - optical_depth function (GPU-based), minimizing data copies.
-# -------------------------------------------------------------------
-#  (C) 2021-2023 Patricio Cubillos under GPL-2.0 license
+# Copyright (c) 2021-2023 Patricio Cubillos
+# Pyrat Bay is open-source software under the GPL-2.0 license (see LICENSE)
 
 __all__ = [
     'Spectrum',
@@ -13,83 +8,61 @@ __all__ = [
     'intensity',
     'flux',
     'two_stream',
-    'optical_depth',
 ]
 
 import numpy as np
 import scipy.constants as sc
 import scipy.special as ss
 from scipy.interpolate import interp1d
-from time import perf_counter
-
-# Attempt to import CuPy, else fallback
-try:
-    import cupy as cp
-    GPU_AVAILABLE = True
-except ImportError:
-    GPU_AVAILABLE = False
-
 import pycuda.driver as drv
 import pycuda.autoinit
-from   pycuda.compiler import SourceModule
-
-# Pyrat Bay internals
+from pycuda.compiler import SourceModule
+from time import perf_counter
 from .. import constants as pc
 from .. import io
 from .. import spectrum as ps
 from .. import tools as pt
 from ..lib import _trapz as t
-from ..lib import cutils as cu
-from .. import atmosphere as pa
+import pycuda.gpuarray as gpuarray
 
-# -------------------------------------------------------------------
-#   S P E C T R U M   C L A S S
-# -------------------------------------------------------------------
+
+
 class Spectrum():
     def __init__(self, inputs, log):
         """
         Make the wavenumber sample from user inputs.
-        NOTE: We do NOT use CuPy here. We stay on CPU (NumPy).
-        This avoids type errors with code that expects a NumPy array.
         """
         log.head('\nGenerating wavenumber array.')
 
-        self.specfile  = inputs.specfile  # Transmission/Emission spectrum file
-        self.intensity = None            # Intensity spectrum array
-        self.clear     = None            # Clear modulation spectrum (patchy)
-        self.cloudy    = None            # Cloudy modulation spectrum (patchy)
-        self.starflux  = None            # Stellar flux
-        self.wnosamp   = None
-        self.wn        = None
-        self.nwave     = None
-        self.spectrum  = None
+        self.specfile = inputs.specfile # Transmission/Emission spectrum file
+        self.intensity = None  # Intensity spectrum array
+        self.clear     = None  # Clear modulation spectrum for patchy model
+        self.cloudy    = None  # Cloudy modulation spectrum for patchy model
+        self.starflux  = None  # Stellar flux spectrum
+        self.wnosamp = None
 
-        # Quadrature set-up for emission, on CPU:
+        # Gaussian-quadrature flux integration over hemisphere (for emission)
         if inputs.quadrature is not None:
             self.quadrature = inputs.quadrature
-            # p_roots is CPU-based
             qnodes, qweights = ss.p_roots(self.quadrature)
-            # Scale from [-1,1] to [0,1]:
             qnodes = 0.5*(qnodes + 1.0)
             self.raygrid = np.arccos(np.sqrt(qnodes))
             self.quadrature_mu = np.sqrt(qnodes)
             weights = 0.5 * np.pi * qweights
         else:
-            # If custom angles:
-            raygrid = inputs.raygrid * sc.degree  # CPU array
-            if raygrid[0] != 0.0:
+            # Custom defined mu-angles:
+            raygrid = inputs.raygrid * sc.degree
+            if raygrid[0] != 0:
                 log.error('First angle in raygrid must be 0.0 (normal)')
             if np.any(raygrid < 0) or np.any(raygrid > 0.5*np.pi):
                 log.error('raygrid angles must lie between 0 and 90 deg')
             if np.any(np.ediff1d(raygrid) <= 0):
                 log.error('raygrid angles must be monotonically increasing')
-
-            self.raygrid = raygrid
             self.quadrature_mu = np.cos(raygrid)
-            N = len(raygrid)
-            bounds = np.linspace(0, 0.5*np.pi, N+1)
-            bounds[1:-1] = 0.5*(raygrid[:-1] + raygrid[1:])
-            weights = np.pi*(np.sin(bounds[1:])**2 - np.sin(bounds[:-1])**2)
+            # Weights are the projected area for each mu range:
+            bounds = np.linspace(0, 0.5*np.pi, len(raygrid)+1)
+            bounds[1:-1] = 0.5 * (raygrid[:-1] + raygrid[1:])
+            weights = np.pi * (np.sin(bounds[1:])**2 - np.sin(bounds[:-1])**2)
 
         self.quadrature_weights = np.expand_dims(weights, axis=1)
         self.nangles = len(self.quadrature_mu)
@@ -102,172 +75,166 @@ class Spectrum():
             self.wlunits = 'um'
         else:
             self.wlunits = inputs.wlunits
-        wl_units = pt.u(self.wlunits)
+        wl_units = pt.u(inputs.wlunits)
 
-        # Low wavenumber boundary logic:
+        # Low wavenumber boundary:
         if inputs.wnlow is None and inputs.wlhigh is None:
-            log.error('Undefined low wavenumber boundary.  Either set wnlow or wlhigh')
+            log.error(
+                'Undefined low wavenumber boundary.  Either set wnlow or wlhigh'
+            )
         if inputs.wnlow is not None and inputs.wlhigh is not None:
             log.warning(
-                f'Both wnlow ({inputs.wnlow:.2e} cm-1) and wlhigh '
-                f'({inputs.wlhigh:.2e} cm) were defined.  wlhigh will be ignored'
+                f'Both wnlow ({self.wnlow:.2e} cm-1) and wlhigh '
+                 '({self.wlhigh:.2e} cm) were defined.  wlhigh will be ignored'
             )
 
         if inputs.wnlow is not None:
-            self.wnlow  = inputs.wnlow
-            self.wlhigh = 1.0/self.wnlow
+            self.wnlow = inputs.wnlow
+            self.wlhigh = 1.0 / self.wnlow
         else:
             self.wlhigh = inputs.wlhigh
-            self.wnlow  = 1.0/self.wlhigh
+            self.wnlow = 1.0 / self.wlhigh
 
-        # High wavenumber boundary logic:
+
+        # High wavenumber boundary:
         if inputs.wnhigh is None and inputs.wllow is None:
-            log.error('Undefined high wavenumber boundary. Either set wnhigh or wllow')
+            log.error(
+                'Undefined high wavenumber boundary. Either set wnhigh or wllow'
+            )
         if inputs.wnhigh is not None and inputs.wllow is not None:
             log.warning(
-                f'Both wnhigh ({inputs.wnhigh:.2e} cm-1) and wllow '
-                f'({inputs.wllow:.2e} cm) were defined.  wllow will be ignored'
+                f'Both wnhigh ({self.wnhigh:.2e} cm-1) and wllow '
+                 '({self.wllow:.2e} cm) were defined.  wllow will be ignored'
             )
 
         if inputs.wnhigh is not None:
             self.wnhigh = inputs.wnhigh
-            self.wllow  = 1.0/self.wnhigh
+            self.wllow = 1.0 / self.wnhigh
         else:
-            self.wllow  = inputs.wllow
-            self.wnhigh = 1.0/self.wllow
+            self.wllow = inputs.wllow
+            self.wnhigh = 1.0 / self.wllow
 
+        # Consistency check (wnlow < wnhigh):
         if self.wnlow > self.wnhigh:
             log.error(
                 f'Wavenumber low boundary ({self.wnlow:.1f} cm-1) must be '
                 f'larger than the high boundary ({self.wnhigh:.1f} cm-1)'
             )
 
-        # Prepare to define wavenumber array:
         self.resolution = None
-        self.wlstep     = None
-        self.wnstep     = None
+        self.wlstep = None
 
-        # If cross-section tables exist, read them on CPU:
+        # If there are cross-section tables, take sampling from there:
         if pt.isfile(inputs.extfile) == 1 and inputs.runmode != 'opacity':
-            wn = io.read_opacity(inputs.extfile[0], extract='arrays')[3]  # CPU numpy array
+            wn = io.read_opacity(inputs.extfile[0], extract='arrays')[3]
 
-            # Crop wavenumber to [wnlow, wnhigh] on CPU:
-            mask = (wn >= self.wnlow) & (wn <= self.wnhigh)
-            self.wn = wn[mask]
+            # Update wavenumber sampling:
+            self.wn = wn[(wn >= self.wnlow) & (wn <= self.wnhigh)]
             self.nwave = len(self.wn)
-            self.spectrum = np.zeros(self.nwave, dtype=np.float64)
+            self.spectrum = np.zeros(self.nwave, np.double)
 
-            # Update boundaries
-            if self.nwave > 0:
-                if self.wnlow <= self.wn[0]:
-                    self.wnlow = self.wn[0]
-                if self.wnhigh >= self.wn[-1]:
-                    self.wnhigh = self.wn[-1]
+            if self.wnlow <= self.wn[0]:
+                self.wnlow = self.wn[0]
+            if self.wnhigh >= self.wn[-1]:
+                self.wnhigh = self.wn[-1]
 
-            # Guess sampling
-            if self.nwave > 2:
-                dwn = np.ediff1d(np.abs(self.wn))
-                dwl = np.ediff1d(np.abs(1.0/self.wn))
-                res = np.abs(self.wn[1:]/dwn)
+            # Guess sampling by looking at std of sampling rates:
+            dwn = np.ediff1d(np.abs(self.wn))
+            dwl = np.ediff1d(np.abs(1.0/self.wn))
+            res = np.abs(self.wn[1:]/dwn)
 
-                std_dwn = np.std(dwn/np.mean(dwn))
-                std_dwl = np.std(dwl/np.mean(dwl))
-                std_res = np.std(res /np.mean(res))
-
-                if std_dwn < std_dwl and std_dwn < std_res:
-                    self.wnstep = self.wn[1]-self.wn[0]
-                    sampling_text = f'sampling rate = {self.wnstep:.2f} cm-1'
-                elif std_dwl < std_dwn and std_dwl < std_res:
-                    self.wlstep = np.abs(1/self.wn[0] - 1/self.wn[1])/pc.um
-                    sampling_text = f'sampling rate = {self.wlstep:.6f} um'
-                else:
-                    g = self.wn[-2]/self.wn[-1]
-                    self.resolution = round(0.5*(1+g)/(1-g), 5)
-                    sampling_text = f'R = {self.resolution:.1f}'
+            std_dwn = np.std(dwn/np.mean(dwn))
+            std_dwl = np.std(dwl/np.mean(dwl))
+            std_res = np.std(res/np.mean(res))
+            if std_dwn < std_dwl and std_dwn < std_res:
+                self.wnstep = self.wn[1] - self.wn[0]
+                sampling_text = f'sampling rate = {self.wnstep:.2f} cm-1'
+            elif std_dwl < std_dwn and std_dwl < std_res:
+                self.wlstep = np.abs(1/self.wn[0] - 1/self.wn[1]) / pc.um
+                sampling_text = f'sampling rate = {self.wlstep:.6f} um'
             else:
-                sampling_text = 'Too few points to guess sampling'
+                g = self.wn[-2]/self.wn[-1]
+                # Assuming no one would care for a R with more than 5 decimals:
+                self.resolution = np.round(0.5*(1+g)/(1-g), decimals=5)
+                #self.wnhigh = 2 * ex.wn[-1]/(1+g)
+                sampling_text = f'R = {self.resolution:.1f}'
 
             log.msg(
-                "Reading spectral sampling from extinction-coefficient table.  "
-                f"Adopting array with {sampling_text}, "
+                "Reading spectral sampling from extinction-coefficient "
+                f"table.  Adopting array with {sampling_text}, "
                 f"and {self.nwave} samples between "
                 f"[{self.wnlow:.2f}, {self.wnhigh:.2f}] cm-1."
             )
             return
 
-        # Otherwise define from user input:
-        no_sampling = (
+
+        # At least one sampling mode must be defined:
+        undefined_sampling_rate = (
             inputs.wnstep is None and
             inputs.wlstep is None and
             inputs.resolution is None
         )
-        if no_sampling:
-            log.error('Undefined spectral sampling rate (set resolution, wnstep, or wlstep)')
+        if undefined_sampling_rate:
+            log.error(
+                'Undefined spectral sampling rate, either set resolution, '
+                'wnstep, or wlstep'
+            )
 
-        # Possibly set wnstep:
-        if inputs.wnstep is not None:
-            self.wnstep = inputs.wnstep
-
-        # Highly composite numbers (for oversampling):
+        # highly composite numbers
         hcn = np.array([
             1, 2, 4, 6, 12, 24, 36, 48, 60, 120, 180, 240, 360, 720, 840,
             1260, 1680, 2160, 2520, 5040, 7560, 10080, 15120, 20160, 25200,
             27720, 45360, 50400, 55440, 83160, 110880, 221760, 277200,
         ])
 
+        if inputs.wnstep is not None:
+            self.wnstep = inputs.wnstep
+        # Default to a wavenumber supersampling ~0.0004 (R ~2e7 at 1.0 um)
         if inputs.wnosamp is None:
-            if self.wnstep is None:
+            if inputs.wnstep is None:
                 self.wnstep = 1.0
-            # find the first hcn dividing wnstep with ratio <= 0.0004
             self.wnosamp = hcn[self.wnstep/hcn <= 0.0004][0]
         else:
             self.wnosamp = inputs.wnosamp
 
         self.resolution = inputs.resolution
-        self.wlstep     = inputs.wlstep
+        self.wlstep = inputs.wlstep
 
-        # Build self.wn on CPU:
-        if self.resolution is not None:
-            # constant-resolving-power sampling:
-            wn_array = ps.constant_resolution_spectrum(
-                self.wnlow, self.wnhigh, self.resolution
+        if inputs.resolution is not None:
+            # Constant-resolving power wavenumber sampling:
+            self.wn = ps.constant_resolution_spectrum(
+                self.wnlow, self.wnhigh, self.resolution,
             )
-            self.wn = np.asarray(wn_array)
             self.wlstep = None
         elif self.wlstep is not None:
-            # constant wavelength sampling => convert to wavenumbers
+            # Constant-sampling rate wavelength sampling:
             wl = np.arange(self.wllow, self.wlhigh, self.wlstep)
-            # wavenumber = 1/wl, flipping if needed
             self.wn = 1.0/np.flip(wl)
-            self.wnlow = float(self.wn[0])
+            self.wnlow = self.wn[0]
             self.resolution = None
         else:
-            # constant wavenumber sampling
-            nwave = int((self.wnhigh - self.wnlow)/self.wnstep) + 1
-            self.wn = self.wnlow + np.arange(nwave)*self.wnstep
-
-        self.nwave = self.wn.size
-        self.spectrum = np.zeros(self.nwave, dtype=np.float64)
+            # Constant-sampling rate wavenumber sampling:
+            nwave = int((self.wnhigh-self.wnlow)/self.wnstep) + 1
+            self.wn = self.wnlow + np.arange(nwave) * self.wnstep
+        self.nwave = len(self.wn)
 
         # Fine-sampled wavenumber array:
-        if self.wnstep is None or self.wnosamp == 0:
-            self.wnstep = 1.0   # fallback
-            self.wnosamp = 1
-        self.ownstep = self.wnstep/self.wnosamp
-        if not np.isfinite(self.ownstep):
-            self.ownstep = 1e-6
+        self.ownstep = self.wnstep / self.wnosamp
         self.onwave = int(np.ceil((self.wn[-1]-self.wnlow)/self.ownstep)) + 1
-        self.own = self.wnlow + np.arange(self.onwave)*self.ownstep
+        self.own = self.wnlow + np.arange(self.onwave) * self.ownstep
+        self.spectrum = np.zeros(self.nwave, np.double)
+
+        # Get list of divisors:
         self.odivisors = pt.divisors(self.wnosamp)
 
-        # Re-set final boundary
-        if self.wn.size > 0 and self.wn[-1] != self.wnhigh:
+        # Re-set final boundary (stay inside given boundaries):
+        if self.wn[-1] != self.wnhigh:
             log.warning(
-                f'Final wavenumber modified from {self.wnhigh:.4f} cm-1 (input) '
-                f'to {self.wn[-1]:.4f} cm-1'
+                f'Final wavenumber modified from {self.wnhigh:.4f} cm-1 (input)'
+                f'\n                            to {self.wn[-1]:.4f} cm-1'
             )
 
-        # Print info:
+        # Screen output:
         log.msg(
             f'Initial wavenumber boundary:  {self.wnlow:.5e} cm-1  '
             f'({self.wlhigh/wl_units:.3e} {self.wlunits})\n'
@@ -275,10 +242,11 @@ class Spectrum():
             f'({self.wllow/wl_units:.3e} {self.wlunits})',
             indent=2,
         )
+
         if self.resolution is not None:
             msg = f'Spectral resolving power: {self.resolution:.1f}'
         elif self.wlstep is not None:
-            wl_step = self.wlstep/wl_units
+            wl_step = self.wlstep / wl_units
             msg = f'Wavelength sampling interval: {wl_step:.2g} {self.wlunits}'
         else:
             msg = f'Wavenumber sampling interval: {self.wnstep:.2g} cm-1'
@@ -312,14 +280,17 @@ class Spectrum():
         if self.resolution is None:
             fw.write('Sampling interval (wnstep): {:.3f} cm-1', self.wnstep)
         else:
-            fw.write('Spectral resolving power (resolution): {:.1f}', self.resolution)
-
+            fw.write(
+                'Spectral resolving power (resolution): {:.1f}',
+                self.resolution,
+            )
         fw.write(
             'Wavenumber array (wn, cm-1):\n    {}',
             self.wn,
             fmt={'float': '{: .3f}'.format},
         )
         fw.write('Oversampling factor (wnosamp): {:d}', self.wnosamp)
+
 
         fw.write(
             '\nGaussian quadrature cos(theta) angles (quadrature_mu):\n    {}',
@@ -333,10 +304,8 @@ class Spectrum():
         )
         if self.intensity is not None:
             fw.write('Intensity spectra (intensity, erg s-1 cm-2 sr-1 cm):')
-            for intensity_row in self.intensity:
-                fw.write('    {}', intensity_row, fmt=fmt, edge=3)
-
-        # Print out final spectrum depending on RT path:
+            for intensity in self.intensity:
+                fw.write('    {}', intensity, fmt=fmt, edge=3)
         if self._rt_path in pc.emission_rt:
             fw.write(
                 'Emission spectrum (spectrum, erg s-1 cm-2 cm):\n    {}',
@@ -350,435 +319,428 @@ class Spectrum():
         return fw.text
 
 
-#
-#    M E T H O D S   (do GPU stuff)
-#
-
 def spectrum(pyrat):
     """
     Spectrum calculation driver.
     """
     pyrat.log.head('\nCalculate the planetary spectrum.')
 
-    # Initialize the spectrum array (CPU-based by default):
-    pyrat.spec.spectrum = np.zeros(pyrat.spec.nwave, dtype=np.float64)
+    # Initialize the spectrum array:
+    pyrat.spec.spectrum = np.empty(pyrat.spec.nwave, np.double)
     if pyrat.opacity.is_patchy:
-        pyrat.spec.clear  = np.zeros(pyrat.spec.nwave, dtype=np.float64)
-        pyrat.spec.cloudy = np.zeros(pyrat.spec.nwave, dtype=np.float64)
+        pyrat.spec.clear  = np.empty(pyrat.spec.nwave, np.double)
+        pyrat.spec.cloudy = np.empty(pyrat.spec.nwave, np.double)
 
-    # Dispatch to geometry-specific calls:
+    # Call respective function depending on the RT/geometry:
     if pyrat.od.rt_path in pc.transmission_rt:
         modulation(pyrat)
+
     elif pyrat.od.rt_path == 'emission':
         intensity(pyrat)
         flux(pyrat)
+
     elif pyrat.od.rt_path == 'emission_two_stream':
         two_stream(pyrat)
 
-    # Possibly scale the emission flux:
     if pyrat.spec.f_dilution is not None and pyrat.od.rt_path in pc.emission_rt:
         pyrat.spec.spectrum *= pyrat.spec.f_dilution
 
-    # Output to file:
-    wn = pyrat.spec.wn  # still CPU
-    io.write_spectrum(1.0/wn, pyrat.spec.spectrum, pyrat.spec.specfile,
-                      'transit' if pyrat.od.rt_path in pc.transmission_rt else 'emission')
+    # Print spectrum to file:
+    if pyrat.od.rt_path in pc.transmission_rt:
+        spec_type = 'transit'
+    elif pyrat.od.rt_path in pc.emission_rt:
+        spec_type = 'emission'
+
+    io.write_spectrum(
+        1.0/pyrat.spec.wn, pyrat.spec.spectrum, pyrat.spec.specfile, spec_type)
     if pyrat.spec.specfile is not None:
         specfile = f": '{pyrat.spec.specfile}'"
     else:
         specfile = ""
-    pyrat.log.head(f"Computed spectrum{specfile}.", indent=2)
+    pyrat.log.head(f"Computed {spec_type} spectrum{specfile}.", indent=2)
     pyrat.log.head('Done.')
 
+try:
+    from . import spectrum_cuda
+    CUDA_AVAILABLE = True
+except ImportError:
+    CUDA_AVAILABLE = False
 
-def modulation(pyrat):
+def compute_combined_gpu(pyrat):
     """
-    Example GPU usage in the exponent + multiplication steps,
-    then fallback to CPU trapz2D.
+    Optimized combined computation of optical depth and spectrum using GPU.
     """
-    import cupy as cp  # Or use the 'xp' approach from your code
-    GPU_AVAILABLE = True  # If you’ve already tested `cp` import, etc.
-
-    rtop    = pyrat.atm.rtop
-    radius  = pyrat.atm.radius    # CPU (NumPy array)
-    depth   = pyrat.od.depth      # CPU (NumPy array)
-    nlayers = pyrat.od.ideep - rtop + 1
-
-    # 1) Transfer arrays to GPU:
-    if GPU_AVAILABLE:
-        radius_gpu = cp.asarray(radius)             # shape [nlayers_total]
-        depth_gpu  = cp.asarray(depth)              # shape [nlayers_total, nwave]
-        # We only care about rtop: for the partial slices:
-        h_gpu = cp.ediff1d(radius_gpu[rtop:])
-        integ_gpu = cp.exp(-depth_gpu[rtop:,:]) * cp.expand_dims(radius_gpu[rtop:], 1)
-    else:
-        # fallback CPU
-        import numpy as np
-        h_cpu = np.ediff1d(radius[rtop:])
-        integ_cpu = np.exp(-depth[rtop:,:]) * np.expand_dims(radius[rtop:],1)
-
-    # 2) Deck model fix on CPU:
-    #    We must do interpolation with CPU-based interp1d => need data on CPU:
-    if GPU_AVAILABLE:
-        h_cpu = h_gpu.get()          # copy to CPU
-        integ_cpu = integ_gpu.get()  # copy to CPU
-    else:
-        # already on CPU
-        pass
-
-    for model in pyrat.opacity.models:
-        if model.name == 'deck' and model.itop > rtop:
-            deck_index = model.itop - rtop - 1
-            h_cpu[deck_index] = model.rsurf - radius[model.itop-1]
-            f = interp1d(radius[rtop:], integ_cpu, axis=0)   # CPU SciPy
-            new_val = f(model.rsurf)
-            integ_cpu[model.itop - rtop] = new_val
-            break
-
-    # 3) CPU-based 2D trapz:
-    #    You could move to GPU-based trapz if you want, but let's say it’s CPU:
-    spectrum_val = t.trapz2D(integ_cpu, h_cpu, nlayers - 1)
-
-    rp = radius[rtop]
-    pyrat.spec.spectrum = (rp*rp + 2.0*spectrum_val)/(pyrat.phy.rstar**2)
-
-    # 4) Patchy case:
-    if pyrat.opacity.is_patchy:
-        # similarly handle depth_clear, etc.
-        depth_clear = pyrat.od.depth_clear
-        nlayers_clear = pyrat.od.ideep_clear - rtop + 1
-        if GPU_AVAILABLE:
-            depth_clear_gpu = cp.asarray(depth_clear)
-            integ_clear_gpu = cp.exp(-depth_clear_gpu[rtop:,:]) \
-                              * cp.expand_dims(radius_gpu[rtop:],1)
-            h_clear_gpu = h_gpu.copy()
-            # Then copy back to CPU:
-            h_clear_cpu      = h_clear_gpu.get()
-            integ_clear_cpu  = integ_clear_gpu.get()
-        else:
-            # CPU fallback
-            h_clear_cpu = h_cpu.copy()
-            integ_clear_cpu = (
-                np.exp(-depth_clear[rtop:,:])
-                * np.expand_dims(radius[rtop:], 1)
-            )
-
-        clear_val = t.trapz2D(integ_clear_cpu, h_clear_cpu, nlayers_clear-1)
-        clear_spectrum = (rp*rp + 2*clear_val)/(pyrat.phy.rstar**2)
-
-        pyrat.spec.clear  = clear_spectrum
-        pyrat.spec.cloudy = pyrat.spec.spectrum
-        fpatchy = pyrat.opacity.fpatchy
-        pyrat.spec.spectrum = (pyrat.spec.cloudy*fpatchy +
-                               pyrat.spec.clear*(1.0 - fpatchy))
-
-
-def intensity(pyrat):
-    """
-    Calculate the intensity spectrum (erg s-1 cm-2 sr-1 cm)
-    for eclipse geometry.
-    """
-    # If we want, we can do partial GPU. For brevity, let's stay CPU-only here:
-    spec = pyrat.spec
-    pyrat.log.msg('Computing intensity spectrum (CPU).', indent=2)
-
-    spec.intensity = np.zeros((spec.nangles, spec.nwave), dtype=np.float64)
-
-    # Build blackbody array B on CPU:
-    B = np.zeros((pyrat.atm.nlayers, spec.nwave), dtype=np.float64)
-    ps.blackbody_wn_2D(spec.wn, pyrat.atm.temp, B, pyrat.od.ideep)
-
-    # If there's a deck surface:
-    for model in pyrat.opacity.models:
-        if model.name == 'deck':
-            B[model.itop] = ps.blackbody_wn(spec.wn, model.tsurf)
-
-    pyrat.od.B = B  # store it in case needed
-
-    # Now do plane-parallel integration. If t.intensity is CPU-based:
-    spec.intensity = t.intensity(
-        pyrat.od.depth, pyrat.od.ideep, B,
-        spec.quadrature_mu, pyrat.atm.rtop,
-    )
-
-
-def flux(pyrat):
-    spec = pyrat.spec
-    if GPU_AVAILABLE:
-        import cupy as cp
-        intensity_gpu = cp.asarray(spec.intensity)                # shape (nangles, nwave)
-        weights_gpu   = cp.asarray(spec.quadrature_weights)       # shape (nangles, 1)
-        flux_gpu = cp.sum(intensity_gpu * weights_gpu, axis=0)    # shape (nwave)
-        spec.spectrum = flux_gpu.get()                            # copy to CPU
-    else:
-        spec.spectrum[:] = np.sum(
-            spec.intensity * spec.quadrature_weights, axis=0
-        )
-
-def two_stream(pyrat):
-    pyrat.log.msg('Compute two-stream flux spectrum (GPU partial).', indent=2)
-    spec = pyrat.spec
-    phy  = pyrat.phy
-    nlayers = pyrat.atm.nlayers
-
-    # Planck from interior T
-    spec.f_int = ps.blackbody_wn(spec.wn, pyrat.atm.tint)  # CPU
-    total_f_int = np.trapz(spec.f_int, spec.wn)
-    if total_f_int > 0:
-        scale = pc.sigma*(pyrat.atm.tint**4)/total_f_int
-        spec.f_int *= scale
-
-    dtau0_cpu = np.diff(pyrat.od.depth, axis=0)  # CPU
-    # We'll do trans partially on GPU:
-    if GPU_AVAILABLE:
-        import cupy as cp
-        dtau0_gpu = cp.asarray(dtau0_cpu)
-        # But we need exp1, which is CPU-based:
-        dtau0_cpu2 = dtau0_gpu.get()
-        trans_cpu = (1 - dtau0_cpu2)*np.exp(-dtau0_cpu2) + dtau0_cpu2**2 * ss.exp1(dtau0_cpu2)
-        trans_gpu = cp.asarray(trans_cpu)
-    else:
-        trans_cpu = (1 - dtau0_cpu)*np.exp(-dtau0_cpu) + dtau0_cpu**2*ss.exp1(dtau0_cpu)
-        trans_gpu = None  # Not used if no GPU
-
-    # Build blackbody B
-    B = ps.blackbody_wn_2D(spec.wn, pyrat.atm.temp)  # CPU
-    Bp_cpu = np.diff(B, axis=0)/dtau0_cpu           # CPU
-
-    # Possibly copy B, Bp to GPU if we want to do the up/down loops on GPU:
-    # For a small code snippet, we might keep them CPU:
-    flux_down = np.zeros((nlayers, spec.nwave), dtype=float)
-    flux_up   = np.zeros((nlayers, spec.nwave), dtype=float)
-
-    # Possibly star flux
-    is_irr = (spec.starflux is not None and pyrat.atm.smaxis is not None and phy.rstar is not None)
-    if is_irr:
-        flux_down[0] = pyrat.atm.beta_irr * (phy.rstar/pyrat.atm.smaxis)**2 * spec.starflux
-
-    # CPU loops:
-    for i in range(nlayers-1):
-        td = trans_cpu[i] if trans_gpu is not None else 1.0  # fallback
-        flux_down[i+1] = (
-            td*flux_down[i] + np.pi*B[i]*(1-td)
-            + np.pi*Bp_cpu[i]*(
-                -2/3*(1 - np.exp(-dtau0_cpu[i])) + dtau0_cpu[i]*(1 - td/3)
-            )
-        )
-
-    flux_up[-1] = flux_down[-1] + spec.f_int
-    for i in reversed(range(nlayers-1)):
-        td = trans_cpu[i]
-        flux_up[i] = (
-            td*flux_up[i+1] + np.pi*B[i+1]*(1-td)
-            + np.pi*Bp_cpu[i]*(
-                2/3*(1 - np.exp(-dtau0_cpu[i])) - dtau0_cpu[i]*(1 - td/3)
-            )
-        )
-
-    spec.spectrum = flux_up[0]
-
-
-
-# -------------------------------------------------------------------
-#   O P T I C A L   D E P T H   (optimized to reduce copies)
-# -------------------------------------------------------------------
-def optical_depth(pyrat):
-    """
-    Calculate the optical depth in transmission geometry or emission,
-    with fewer CPU<->GPU copies.
-    """
-    start_od = perf_counter()
+    start_time = perf_counter()
+    
+    # Extract needed variables
     od = pyrat.od
     nwave = pyrat.spec.nwave
     nlayers = pyrat.atm.nlayers
     rtop = pyrat.atm.rtop
-    f_patchy = pyrat.opacity.fpatchy
+    radius = pyrat.atm.radius
+    rstar_squared = pyrat.phy.rstar**2
+    
+    # Pre-calculate arrays on CPU to minimize GPU memory operations
+    h = np.ascontiguousarray(np.ediff1d(radius[rtop:]), dtype=np.float64)
+    radius_arr = np.ascontiguousarray(radius, dtype=np.float64)
+    
+    # Use shared memory for frequently accessed data
+    cuda_code = """
+    #include <math.h>
+    
+    __global__ void compute_combined_kernel(
+        double *__restrict__ tau,
+        int *__restrict__ ideep,
+        const double *__restrict__ intervals,
+        const double taumax,
+        const double *__restrict__ data,
+        const double *__restrict__ radius,
+        const double *__restrict__ h,
+        double *__restrict__ spectrum,
+        const int nwave,
+        const int nr,
+        const int rtop,
+        const double rstar_squared,
+        const int max_length
+    ) {
+        // Shared memory for frequently accessed data
+        extern __shared__ double shared_data[];
+        double *shared_radius = shared_data;
+        double *shared_h = &shared_data[nr];
+        
+        // Load data into shared memory
+        int tid = threadIdx.x;
+        for (int i = tid; i < nr && i < blockDim.x; i += blockDim.x) {
+            if (i < nr) {
+                shared_radius[i] = radius[i];
+                if (i < nr-rtop) {
+                    shared_h[i] = h[i];
+                }
+            }
+        }
+        __syncthreads();
+        
+        int jx = blockIdx.x * blockDim.x + threadIdx.x;
+        if (jx < nwave) {
+            // Register cache for frequently used values
+            const double rtop_radius_sq = shared_radius[rtop] * shared_radius[rtop];
+            double integral = 0.0;
+            int max_layer = -1;
+            
+            // Optical depth and spectrum calculation combined loop
+            #pragma unroll 4
+            for (int r = 0; r < nr - rtop; r++) {
+                if (max_layer < 0) {
+                    double tau_val = 0.0;
+                    
+                    // Vectorized reduction for integral calculation
+                    #pragma unroll 4
+                    for (int i = 0; i <= r; i++) {
+                        tau_val += intervals[i + r * max_length] * 
+                                 (data[jx + (i + rtop + 1) * nwave] + 
+                                  data[jx + (i + rtop) * nwave]);
+                    }
+                    
+                    tau[jx + nwave * r] = tau_val;
+                    
+                    // Early exit if tau exceeds max depth
+                    if (tau_val > taumax) {
+                        max_layer = r;
+                        ideep[jx] = rtop + r;
+                        break;
+                    }
+                    
+                    // Spectrum calculation
+                    double exp_term = exp(-tau_val);
+                    double r_term = shared_radius[r + rtop];
+                    integral += exp_term * r_term * shared_h[r];
+                }
+            }
+            
+            if (max_layer < 0) {
+                max_layer = nr - rtop - 1;
+                ideep[jx] = nr - 1;
+            }
+            
+            // Final spectrum calculation
+            spectrum[jx] = (rtop_radius_sq + 2.0 * integral) / rstar_squared * 100.0;
+        }
+    }
+    """
+    
+    # Compile kernel with optimization flags
+    mod = SourceModule(cuda_code, options=['-O3', '--use_fast_math'])
+    
+    # Prepare arrays
+    data_flatten = np.ascontiguousarray(od.ec, dtype=np.float64)
+    
+    # Handle inhomogeneous raypath array
+    max_length = max(len(path) for path in od.raypath[rtop:nlayers])
+    intervals = np.zeros((nlayers-rtop, max_length), dtype=np.float64)
+    for i, path in enumerate(od.raypath[rtop:nlayers]):
+        intervals[i, :len(path)] = path
+    intervals = np.ascontiguousarray(intervals.flatten(), dtype=np.float64)
+    
+    ideep = np.array(np.tile(-1, nwave), dtype=np.int32)
+    spectrum = np.zeros(nwave, dtype=np.float64)
+    
+    try:
+        # Allocate GPU memory using gpuarray for better memory management
+        data_gpu = gpuarray.to_gpu(data_flatten)
+        intervals_gpu = gpuarray.to_gpu(intervals)
+        radius_gpu = gpuarray.to_gpu(radius_arr)
+        h_gpu = gpuarray.to_gpu(h)
+        ideep_gpu = drv.mem_alloc(ideep.nbytes)
+        spectrum_gpu = drv.mem_alloc(spectrum.nbytes)
+        tau_gpu = drv.mem_alloc(data_flatten.nbytes)
+        
+        # Calculate optimal thread/block configuration
+        max_threads = drv.Context.get_device().get_attribute(drv.device_attribute.MAX_THREADS_PER_BLOCK)
+        threads_per_block = min(256, max_threads)
+        blocks_per_grid = (nwave + threads_per_block - 1) // threads_per_block
+        
+        # Calculate shared memory size
+        shared_mem_size = (nlayers + (nlayers-rtop)) * np.dtype(np.float64).itemsize
+        
+        # Launch kernel
+        kernel = mod.get_function("compute_combined_kernel")
+        kernel(
+            tau_gpu,
+            ideep_gpu,
+            intervals_gpu,
+            np.float64(od.maxdepth),
+            data_gpu,
+            radius_gpu,
+            h_gpu,
+            spectrum_gpu,
+            np.int32(nwave),
+            np.int32(nlayers),
+            np.int32(rtop),
+            np.float64(rstar_squared),
+            np.int32(max_length),
+            block=(threads_per_block, 1, 1),
+            grid=(blocks_per_grid, 1, 1),
+            shared=shared_mem_size
+        )
+        
+        # Copy results back
+        drv.memcpy_dtoh(od.depth, tau_gpu)
+        drv.memcpy_dtoh(ideep, ideep_gpu)
+        drv.memcpy_dtoh(spectrum, spectrum_gpu)
+        
+        # Clean up
+        data_gpu.gpudata.free()
+        intervals_gpu.gpudata.free()
+        radius_gpu.gpudata.free()
+        h_gpu.gpudata.free()
+        ideep_gpu.free()
+        spectrum_gpu.free()
+        tau_gpu.free()
+        
+        return spectrum, od.depth, ideep
+        
+    except Exception as e:
+        # Cleanup in case of error
+        try:
+            data_gpu.gpudata.free()
+            intervals_gpu.gpudata.free()
+            radius_gpu.gpudata.free()
+            h_gpu.gpudata.free()
+            ideep_gpu.free()
+            spectrum_gpu.free()
+            tau_gpu.free()
+        except:
+            pass
+        raise e
 
-    pyrat.log.head('\nBegin optical-depth calculation.')
+def modulation(pyrat):
+    """
+    Optimized transmission spectrum calculation for transit geometry.
+    Uses GPU when available, falls back to optimized CPU implementation.
+    """
+    try:
+        # Try GPU computation first
+        spectrum, depth, ideep = compute_combined_gpu(pyrat)
+        pyrat.spec.spectrum = spectrum
+        pyrat.od.depth = depth
+        pyrat.od.ideep = ideep
+        
+    except Exception as e:
+        # Fall back to CPU if GPU fails
+        pyrat.log.warning(f"GPU computation failed, falling back to CPU: {e}")
+        
+        rtop = pyrat.atm.rtop
+        radius = pyrat.atm.radius
+        depth = pyrat.od.depth
+        
+        # Optimized CPU implementation
+        h = np.ediff1d(radius[rtop:])
+        radius_expanded = np.expand_dims(radius[rtop:], 1)
+        depth_slice = depth[rtop:,:]
+        
+        # Vectorized exponential calculation
+        exp_terms = np.exp(-depth_slice)
+        integ = exp_terms * radius_expanded
+        
+        # Efficient integration
+        nlayers = pyrat.od.ideep - rtop + 1
+        spectrum = t.trapz2D(integ, h, nlayers-1)
+        pyrat.spec.spectrum = (radius[rtop]**2 + 2*spectrum) / pyrat.phy.rstar**2
+        
+        if pyrat.opacity.is_patchy:
+            depth_clear = pyrat.od.depth_clear
+            h_clear = h
+            
+            # Vectorized calculation for patchy clouds
+            exp_terms_clear = np.exp(-depth_clear[rtop:,:])
+            integ_clear = exp_terms_clear * radius_expanded
+            
+            nlayers = pyrat.od.ideep_clear - rtop + 1
+            pyrat.spec.clear = t.trapz2D(integ_clear, h_clear, nlayers-1)
+            pyrat.spec.clear = (
+                (radius[rtop]**2 + 2*pyrat.spec.clear) / pyrat.phy.rstar**2
+            )
+            pyrat.spec.cloudy = pyrat.spec.spectrum
+            
+            # Vectorized mixing calculation
+            f_patchy = pyrat.opacity.fpatchy
+            pyrat.spec.spectrum = (
+                pyrat.spec.cloudy * f_patchy +
+                pyrat.spec.clear * (1-f_patchy)
+            )
+    
+    # Original CPU implementation follows...
 
-    # Allocate arrays (CPU or GPU).
-    # We'll do the entire extinction on GPU if available:
-    if GPU_AVAILABLE:
-        xp = cp
-        od.ec       = xp.empty((nlayers, nwave), dtype=xp.float64)
-        od.depth    = xp.zeros((nlayers, nwave), dtype=xp.float64)
-        if f_patchy is not None:
-            od.ec_clear   = xp.empty((nlayers, nwave), dtype=xp.float64)
-            od.depth_clear= xp.zeros((nlayers, nwave), dtype=xp.float64)
-    else:
-        xp = np
-        od.ec       = np.empty((nlayers, nwave), dtype=np.float64)
-        od.depth    = np.zeros((nlayers, nwave), dtype=np.float64)
-        if f_patchy is not None:
-            od.ec_clear    = np.empty((nlayers, nwave), dtype=np.float64)
-            od.depth_clear = np.zeros((nlayers, nwave), dtype=np.float64)
+def intensity(pyrat):
+    """Calculate the intensity spectrum for eclipse geometry."""
+    spec = pyrat.spec
+    pyrat.log.msg('Computing intensity spectrum.', indent=2)
 
-    # Ray path:
-    if od.rt_path in pc.emission_rt:
-        # radius is CPU array
-        if GPU_AVAILABLE:
-            od.raypath = -cu.ediff(np.asanyarray(pyrat.atm.radius))  # returns CPU array
-        else:
-            od.raypath = -cu.ediff(pyrat.atm.radius)
-    elif od.rt_path in pc.transmission_rt:
-        od.raypath = pa.transit_path(pyrat.atm.radius, rtop)  # CPU
+    # Allocate intensity array
+    spec.intensity = np.empty((spec.nangles, spec.nwave), np.double)
 
-    # Sum contributions into od.ec:
-    # Copy from CPU-based pyrat.opacity.ec to GPU if needed
-    if GPU_AVAILABLE:
-        od.ec[rtop:] = cp.asarray(pyrat.opacity.ec[rtop:])
-        if f_patchy is not None:
-            od.ec_clear[rtop:] = cp.asarray(pyrat.opacity.ec[rtop:])
-            # add cloud
-            od.ec[rtop:] += cp.asarray(pyrat.opacity.ec_cloud[rtop:])
-    else:
-        od.ec[rtop:] = pyrat.opacity.ec[rtop:]
-        if f_patchy is not None:
-            od.ec_clear[rtop:] = od.ec[rtop:].copy()
-            od.ec[rtop:] += pyrat.opacity.ec_cloud[rtop:]
+    # Calculate the Planck Emission
+    pyrat.od.B = np.zeros((pyrat.atm.nlayers, spec.nwave), np.double)
+    ps.blackbody_wn_2D(spec.wn, pyrat.atm.temp, pyrat.od.B, pyrat.od.ideep)
 
-    rbottom = nlayers
     for model in pyrat.opacity.models:
         if model.name == 'deck':
-            rbottom = model.itop + 1
-            break
+            pyrat.od.B[model.itop] = ps.blackbody_wn(pyrat.spec.wn, model.tsurf)
 
-    # If emission, we can skip the PyCUDA kernel approach:
-    if od.rt_path in pc.emission_rt:
-        # Just set od.ideep if needed, or do CPU-based approach
-        od.ideep = np.tile(nlayers-1, nwave)
-        pass
-
-    elif od.rt_path in pc.transmission_rt:
-        # Single CPU->GPU flatten pass for ec, intervals, etc.
-        # Then one kernel call, and one GPU->CPU pass for depth (if we want depth on CPU).
-        # But we already have ec on GPU if GPU_AVAILABLE.
-
-        od.ideep = np.full(nwave, -1, dtype=np.int32)
-
-        # Build intervals (padded_arrays) from raypath on CPU:
-        # raypath is CPU array shape: [nlayers-1 or so, ...]
-        # shape must be (rbottom-rtop, something). We'll pad them if needed
-        # for the kernel logic:
-        if (rbottom - rtop) <= 0:
-            # no layers
-            pass
-        else:
-            max_len = len(od.raypath[-1])  # last sub-array length
-            padded_arrays_cpu = np.array([
-                np.pad(row, (0, max_len - len(row)), 'constant')
-                for row in od.raypath[rtop:rbottom]
-            ], dtype=np.float64)
-
-            # Flatten data & allocate tau
-            if GPU_AVAILABLE:
-                data_flat  = od.ec.reshape(-1)       # ec on GPU => we need it as CPU for PyCUDA, so .get()
-                data_flat_cpu = data_flat.get()
-                intervals_cpu = padded_arrays_cpu.ravel()
-                od_depth_flat_cpu = np.zeros_like(data_flat_cpu)
-            else:
-                data_flat_cpu = od.ec.reshape(-1)
-                intervals_cpu = padded_arrays_cpu.ravel()
-                od_depth_flat_cpu = np.zeros_like(data_flat_cpu)
-
-            mod = SourceModule(r"""
-            __global__ void parallelize_tau_gloria_for(
-                double *tau, 
-                int *ideep, 
-                double *intervals, 
-                double taumax, 
-                double *data, 
-                int nwave,
-                int nr,
-                int rtop
-            ){
-              int jx = blockIdx.x * blockDim.x + threadIdx.x;
-              if (jx < nwave){
-                int i, r;
-                ideep[jx] = -1;
-                for(r = 0; r < nr; r++){
-                  double Integral = 0.0;
-                  // init tau=0
-                  tau[jx + nwave*r] = 0.0;
-                  if(ideep[jx]<0){
-                    for(i=0; i<=r; i++){
-                      Integral += intervals[i + r*(nr-1)]
-                                * (data[jx+(i+1)*nwave] + data[jx + i*nwave]);
-                    }
-                    tau[jx + nwave*r] = Integral;
-                    if(Integral > taumax){
-                      ideep[jx] = r;
-                    }
-                  }
-                }
-              }
-            }""")
-
-            # Allocate on GPU with PyCUDA driver API:
-            data_gpu      = drv.mem_alloc(data_flat_cpu.nbytes)
-            intervals_gpu = drv.mem_alloc(intervals_cpu.nbytes)
-            ideep_gpu     = drv.mem_alloc(od.ideep.nbytes)
-            tau_gpu       = drv.mem_alloc(od_depth_flat_cpu.nbytes)
-
-            # Copy CPU->GPU
-            drv.memcpy_htod(data_gpu,      data_flat_cpu)
-            drv.memcpy_htod(intervals_gpu, intervals_cpu)
-            drv.memcpy_htod(ideep_gpu,     od.ideep)
-
-            # Kernel launch
-            N_Threads_Blocco = 256
-            N_blocks = (nwave + N_Threads_Blocco -1)//N_Threads_Blocco
-            kernel = mod.get_function("parallelize_tau_gloria_for")
-            kernel(
-                tau_gpu,
-                ideep_gpu,
-                intervals_gpu,
-                np.double(od.maxdepth),
-                data_gpu,
-                np.int32(nwave),
-                np.int32(nlayers),
-                np.int32(rtop),
-                block=(N_Threads_Blocco,1,1),
-                grid=(N_blocks,1,1),
+    # Check if we can use CUDA
+    if CUDA_AVAILABLE:
+        try:
+            spec.intensity = spectrum_cuda.compute_intensity_cuda(
+                pyrat.od.depth,
+                pyrat.od.B,
+                spec.quadrature_mu,
+                pyrat.atm.rtop
             )
-            drv.Context.synchronize()
+            return
+        except Exception as e:
+            pyrat.log.warning(f"CUDA computation failed, falling back to CPU: {e}")
 
-            # Copy GPU->CPU
-            drv.memcpy_dtoh(od_depth_flat_cpu, tau_gpu)
-            drv.memcpy_dtoh(od.ideep, ideep_gpu)
 
-            # free GPU
-            data_gpu.free()
-            intervals_gpu.free()
-            ideep_gpu.free()
-            tau_gpu.free()
+def intensity(pyrat):
+    """
+    Calculate the intensity spectrum (erg s-1 cm-2 sr-1 cm) for
+    eclipse geometry.
+    """
+    spec = pyrat.spec
+    pyrat.log.msg('Computing intensity spectrum.', indent=2)
 
-            # reshape od_depth back
-            od_depth_cpu = od_depth_flat_cpu.reshape(nlayers, nwave)
+    # Allocate intensity array:
+    spec.intensity = np.empty((spec.nangles, spec.nwave), np.double)
 
-            # If we want to keep `od.depth` on GPU, we do:
-            if GPU_AVAILABLE:
-                od.depth = cp.asarray(od_depth_cpu)
-            else:
-                od.depth = od_depth_cpu
+    # Calculate the Planck Emission:
+    pyrat.od.B = np.zeros((pyrat.atm.nlayers, spec.nwave), np.double)
+    ps.blackbody_wn_2D(spec.wn, pyrat.atm.temp, pyrat.od.B, pyrat.od.ideep)
 
-            # correct negative ideep
-            od.ideep[od.ideep<0] = rbottom-1
+    for model in pyrat.opacity.models:
+        if model.name == 'deck':
+            pyrat.od.B[model.itop] = ps.blackbody_wn(pyrat.spec.wn, model.tsurf)
 
-        # If patchy:
-        if f_patchy is not None:
-            # kept the GPU version of patchy calculations
-            od.ideep_clear = np.full(nwave, -1, dtype=np.int32)
-            for r in range(rtop, rbottom):
-                # standard CPU approach from trapz or partial approach
-                od.depth_clear[r] = t.optdepth(
-                    xp.asnumpy(od.ec_clear[rtop:r+1]) if GPU_AVAILABLE else od.ec_clear[rtop:r+1],
-                    od.raypath[r],
-                    od.maxdepth,
-                    od.ideep_clear,
-                    r
-                )
+    # Plane-parallel radiative-transfer intensity integration:
+    spec.intensity = t.intensity(
+        pyrat.od.depth, pyrat.od.ideep, pyrat.od.B, spec.quadrature_mu,
+        pyrat.atm.rtop,
+    )
 
-    end_od = perf_counter()
-    od.time_od = end_od - start_od
-    pyrat.log.head(f"Optical depth done. Total time: {od.time_od:.3f} s.")
+def flux(pyrat):
+    """
+    Calculate the hemisphere-integrated flux spectrum (erg s-1 cm-2 cm)
+    for eclipse geometry.
+    """
+    # Weight-sum the intensities to get the flux:
+    pyrat.spec.spectrum[:] = np.sum(
+        pyrat.spec.intensity * pyrat.spec.quadrature_weights,
+        axis=0,
+    )
+
+
+def two_stream(pyrat):
+    """
+    Two-stream approximation radiative transfer
+    following Heng et al. (2014)
+
+    This function defines downward (flux_down) and uppward fluxes
+    (flux_up) into pyrat.spec, and sets the emission spectrum as the
+    uppward flux at the top of the atmosphere (flux_up[0]):
+
+    flux_up: 2D float ndarray
+        Upward flux spectrum through each layer under the two-stream
+        approximation (erg s-1 cm-2 cm).
+    flux_down: 2D float ndarray
+        Downward flux spectrum through each layer under the two-stream
+        approximation (erg s-1 cm-2 cm).
+    """
+    pyrat.log.msg('Compute two-stream flux spectrum.', indent=2)
+    spec = pyrat.spec
+    phy = pyrat.phy
+    nlayers = pyrat.atm.nlayers
+
+    # Set internal net bolometric flux to sigma*Tint**4:
+    spec.f_int = ps.blackbody_wn(spec.wn, pyrat.atm.tint)
+    total_f_int = np.trapz(spec.f_int, spec.wn)
+    if total_f_int > 0:
+        spec.f_int *= pc.sigma * pyrat.atm.tint**4 / total_f_int
+
+    # Diffusivity factor (Eq. B5 of Heng et al. 2014):
+    dtau0 = np.diff(pyrat.od.depth, n=1, axis=0)
+    trans = (1-dtau0)*np.exp(-dtau0) + dtau0**2 * ss.exp1(dtau0)
+
+    B = pyrat.od.B = ps.blackbody_wn_2D(spec.wn, pyrat.atm.temp)
+    Bp = np.diff(pyrat.od.B, n=1, axis=0) / dtau0
+
+    # Diffuse approximation to compute downward and upward fluxes:
+    spec.flux_down = np.zeros((nlayers, spec.nwave))
+    spec.flux_up = np.zeros((nlayers, spec.nwave))
+
+    is_irradiation = (
+        spec.starflux is not None
+        and pyrat.atm.smaxis is not None
+        and phy.rstar is not None
+    )
+    # Top boundary condition:
+    if is_irradiation:
+        spec.flux_down[0] = \
+            pyrat.atm.beta_irr * (phy.rstar/pyrat.atm.smaxis)**2 * spec.starflux
+    # Eqs. (B6) of Heng et al. (2014):
+    for i in range(nlayers-1):
+        spec.flux_down[i+1] = (
+            trans[i] * spec.flux_down[i]
+            + np.pi * B[i] * (1-trans[i])
+            + np.pi * Bp[i] * (
+                  -2/3 * (1-np.exp(-dtau0[i])) + dtau0[i]*(1-trans[i]/3))
+        )
+
+    spec.flux_up[nlayers-1] = spec.flux_down[nlayers-1] + spec.f_int
+    for i in reversed(range(nlayers-1)):
+        spec.flux_up[i] = (
+            trans[i] * spec.flux_up[i+1]
+            + np.pi * B[i+1] * (1-trans[i])
+            + np.pi * Bp[i] * (
+                  2/3 * (1-np.exp(-dtau0[i])) - dtau0[i]*(1-trans[i]/3))
+        )
+
+    spec.spectrum = spec.flux_up[0]
